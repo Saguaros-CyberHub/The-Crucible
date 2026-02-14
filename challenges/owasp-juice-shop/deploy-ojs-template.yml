@@ -1,0 +1,215 @@
+# Install and Deploy the OWASP Juice Shop Challenge Template on a Debian-based system, then prepare it for templating in Proxmox.
+
+- name: Deploy OWASP Juice Shop Template
+  hosts: all
+  become: true
+  gather_facts: false
+
+  vars:
+    admin_user: root
+    home_dir: "/{{ admin_user }}"
+    challenge_dir: "{{ home_dir }}/juice-shop"
+    is_vm: false
+
+  tasks:
+    - name: Update all packages
+      ansible.builtin.apt:
+        name: "*"
+        state: latest
+        update_cache: true
+
+    - name: Install packages (VM with cloud-init)
+      ansible.builtin.apt:
+        name:
+          - qemu-guest-agent
+          - cloud-init
+          - cloud-utils
+          - nodejs
+          - npm
+          - git
+        state: present
+      ignore_errors: true
+      when: is_vm
+
+    - name: Install packages (LXC - no cloud-init)
+      ansible.builtin.apt:
+        name:
+          - nodejs
+          - npm
+          - git
+        state: present
+      ignore_errors: true
+      when: not is_vm
+
+    - name: Set timezone
+      ansible.builtin.timezone:
+        name: "America/Phoenix"
+
+    # -------------------- Install OWASP Juice Shop --------------------
+    - name: Ensure challenge directory exists
+      ansible.builtin.file:
+        path: "{{ challenge_dir }}"
+        state: directory
+        owner: "{{ admin_user }}"
+        group: "{{ admin_user }}"
+        mode: '0644'
+
+    - name: Clone OWASP Juice Shop repository
+      ansible.builtin.git:
+        repo: "https://github.com/juice-shop/juice-shop.git"
+        clone: true
+        depth: 1
+        dest: "{{ challenge_dir }}"
+        version: "master"
+        update: true
+
+    - name: Install NPM dependencies for OWASP Juice Shop
+      ansible.builtin.command: npm install --prefix "{{ challenge_dir }}"
+      args:
+        chdir: "{{ challenge_dir }}"
+      environment:
+        NODE_ENV: production
+
+    - name: Create systemd service for OWASP Juice Shop
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/juice-shop.service
+        owner: root
+        group: root
+        mode: '0644'
+        content: |
+          [Unit]
+          Description=OWASP Juice Shop
+          After=network.target
+          
+          [Service]
+          Type=simple
+          User={{ admin_user }}
+          WorkingDirectory={{ challenge_dir }}
+          Environment="NODE_ENV=production"
+          ExecStart=/usr/bin/npm start
+          Restart=always
+          RestartSec=10
+          
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Enable juice-shop systemd service
+      ansible.builtin.systemd:
+        name: juice-shop
+        enabled: true
+        daemon_reload: true
+
+    # -------------------- Cloud-init configuration (VMs only) --------------------
+
+    - name: Configure cloud-init to grow root filesystem on first boot
+      ansible.builtin.copy:
+        dest: /etc/cloud/cloud.cfg.d/99-growpart.cfg
+        owner: root
+        group: root
+        mode: '0644'
+        content: |
+          # Automatically grow partition and filesystem on first boot
+          growpart:
+            mode: auto
+            devices: ['/']
+            ignore_growroot_disabled: false
+          resize_rootfs: true
+      when: is_vm
+
+    - name: Set cloud-init datasource list for Proxmox
+      ansible.builtin.copy:
+        dest: /etc/cloud/cloud.cfg.d/90-datasource.cfg
+        owner: root
+        group: root
+        mode: '0644'
+        content: |
+          datasource_list: [ NoCloud, ConfigDrive ]
+      when: is_vm
+
+    - name: Enable cloud-init services (will run on first boot after cloning)
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        enabled: true
+      loop:
+        - cloud-init-local
+        - cloud-init
+        - cloud-config
+        - cloud-final
+      when: is_vm
+
+    # -------------------- Template hygiene / cleanup (VMs only) --------------------
+
+    - name: Remove authorized_keys for all local users
+      ansible.builtin.shell: |
+        find /home -maxdepth 2 -type f -path '*/.ssh/authorized_keys' -delete || true
+        rm -f /{{ admin_user }}/.ssh/authorized_keys || true
+      args:
+        executable: /bin/bash
+      when: is_vm
+
+    - name: Remove SSH host keys (regenerated on first boot)
+      ansible.builtin.shell: rm -f /etc/ssh/ssh_host_*
+      args:
+        executable: /bin/bash
+      when: is_vm
+
+    - name: Ensure dbus directory exists for machine-id symlink
+      ansible.builtin.file:
+        path: /var/lib/dbus
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+      when: is_vm
+
+    - name: Reset machine-id for templating (VM with dbus symlink)
+      ansible.builtin.shell: |
+        set -e
+        : > /etc/machine-id
+        rm -f /var/lib/dbus/machine-id || true
+        ln -sf /etc/machine-id /var/lib/dbus/machine-id
+      args:
+        executable: /bin/bash
+      when: is_vm
+
+    - name: Clean apt cache
+      ansible.builtin.shell: |
+        apt clean all || true
+        rm -rf /var/cache/apt/*
+      args:
+        executable: /bin/bash
+      when: is_vm
+
+    - name: Clean cloud-init state for templating
+      ansible.builtin.command: cloud-init clean --logs --seed
+      ignore_errors: yes
+      when: is_vm
+
+    # -------------------- LXC-specific cleanup --------------------
+
+    - name: Reset machine-id for LXC cloning
+      ansible.builtin.shell: |
+        set -e
+        : > /etc/machine-id
+        rm -f /var/lib/dbus/machine-id || true
+      args:
+        executable: /bin/bash
+      when: not is_vm
+
+    # -------------------- Finalize / poweroff (VMs only) --------------------
+
+    - name: Sync filesystem before shutdown
+      ansible.builtin.command: sync
+      when: is_vm
+
+    - name: Power off the system so it can be turned into a Proxmox template
+      ansible.builtin.command: shutdown -h +1 "Template preparation complete, shutting down"
+      async: 90
+      poll: 0
+      ignore_unreachable: yes
+
+    - name: Wait for system to begin shutdown
+      ansible.builtin.wait_for_connection:
+        timeout: 70
+      ignore_errors: yes
+      ignore_unreachable: yes
